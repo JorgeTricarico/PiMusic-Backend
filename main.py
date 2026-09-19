@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Res
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import tempfile
@@ -103,7 +104,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CHUNK_SIZE = 128 * 1024  # Buffer de 128 KB para streaming fluido
+# Compresión Gzip automática para respuestas JSON y texto (> 1000 bytes)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+class SimpleRateLimiter:
+    """Limitador de tasa por ventana deslizante en memoria para proteger contra abusos."""
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self.clients: Dict[str, List[float]] = {}
+        self._lock = Lock()
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            timestamps = self.clients.get(client_ip, [])
+            valid = [t for t in timestamps if now - t < self.window]
+            if len(valid) >= self.max_requests:
+                self.clients[client_ip] = valid
+                return False
+            valid.append(now)
+            self.clients[client_ip] = valid
+            return True
+
+rate_limiter = SimpleRateLimiter(max_requests=60, window_seconds=60)
+
+def get_client_ip(request: Request) -> str:
+    """Obtiene la IP real del cliente respetando cabeceras de proxies inversos y funnels."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+@app.middleware("http")
+async def security_and_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    # Cabeceras de seguridad compatibles con funnels y navegadores modernos
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    
+    # Políticas de caché para SPA
+    path = request.url.path
+    if path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path in ("/", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+CHUNK_SIZE = 256 * 1024  # Buffer de 256 KB para streaming fluido en 720p/1080p
 CACHE_TTL_SECONDS = 3600  # 1 hora de TTL para caché de URLs de streaming
 CACHE_MAX_ENTRIES = 256   # ~2MB de memoria RAM total
 
@@ -608,7 +658,11 @@ def read_root():
 
 
 @app.get("/api/search")
-def search_youtube(q: str = Query(..., description="Término de búsqueda"), limit: int = Query(16, ge=1, le=30)):
+def search_youtube(request: Request, q: str = Query(..., description="Término de búsqueda"), limit: int = Query(16, ge=1, le=30)):
+    ip = get_client_ip(request)
+    if not rate_limiter.is_allowed(ip):
+        raise HTTPException(status_code=429, detail="Demasiadas solicitudes de búsqueda. Espera un momento.")
+
     if not q.strip():
         return []
 
@@ -647,11 +701,14 @@ def search_youtube(q: str = Query(..., description="Término de búsqueda"), lim
             return cleaned
     except Exception as e:
         logger.error(f"Error en búsqueda: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error al buscar en YouTube")
 
 
 @app.get("/api/info")
-def get_video_info(url: str = Query(..., description="URL o ID de YouTube")):
+def get_video_info(request: Request, url: str = Query(..., description="URL o ID de YouTube")):
+    ip = get_client_ip(request)
+    if not rate_limiter.is_allowed(ip):
+        raise HTTPException(status_code=429, detail="Demasiadas solicitudes. Espera un momento.")
     try:
         data = extract_and_cache_info(url)
         return {

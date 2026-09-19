@@ -205,3 +205,31 @@ def test_live_stream_rejection(monkeypatch):
         extract_and_cache_info("live_video_123")
     assert exc_info.value.status_code == 400
     assert "en vivo" in exc_info.value.detail.lower()
+
+
+def test_security_headers_present(client):
+    """Verifica que todas las respuestas HTTP contengan cabeceras de seguridad estándar."""
+    response = client.get("/")
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "SAMEORIGIN"
+    assert "strict-origin-when-cross-origin" in response.headers.get("Referrer-Policy", "")
+
+
+def test_rate_limiter_triggers_429(client):
+    """Verifica que el limitador de tasa responda con HTTP 429 cuando se excede la cuota."""
+    from main import rate_limiter
+    rate_limiter.clients.clear()
+    
+    test_ip = "192.168.100.99"
+    # Simular saturación de solicitudes
+    for _ in range(rate_limiter.max_requests):
+        rate_limiter.is_allowed(test_ip)
+    
+    # La siguiente petición debe ser rechazada
+    assert not rate_limiter.is_allowed(test_ip)
+    
+    # En endpoint real pasando X-Forwarded-For
+    response = client.get("/api/search?q=test", headers={"X-Forwarded-For": test_ip})
+    assert response.status_code == 429
+    assert "Demasiadas solicitudes" in response.json()["detail"]
+
