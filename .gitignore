@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Variables de entorno y secretos
+.env
+.env.local
+.env.*.local
+*.local
+
+# Datos de sesión, historial y cookies
+cookies.txt
+*.cookies
+history.json
+user_session.json
+
+# Directorios de descargas y multimedia local
+downloads/
+cache/
+*.mp3
+*.mp4
+*.m4a
+*.webm
+*.part
+*.ytdl
+
+# Archivos de logs
+logs/
+*.log
+
+# Testing y Cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editores e IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

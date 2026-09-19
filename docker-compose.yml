@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pimusic-backend
+    restart: unless-stopped
+    ports:
+      - "${PIMUSIC_PORT:-5000}:5000"
+    environment:
+      - PIMUSIC_HOST=0.0.0.0
+      - PIMUSIC_PORT=5000
+      - PIMUSIC_DOWNLOADS_DIR=/app/downloads
+      - PIMUSIC_CORS_ORIGINS=${PIMUSIC_CORS_ORIGINS:-*}
+    volumes:
+      # Volumen persistente para almacenar canciones, videos y biblioteca
+      - ./downloads:/app/downloads
+      # Archivo de cookies opcional para evitar limitaciones de YouTube
+      # - ./cookies.txt:/app/downloads/system/cookies.txt:ro

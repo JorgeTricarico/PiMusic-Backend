@@ -1,0 +1,24 @@
+[Unit]
+Description=PiMusic High-Performance Remote API & Media Streamer
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jorge
+WorkingDirectory=/home/jorge/pimusic-backend
+EnvironmentFile=-/home/jorge/pimusic-backend/.env
+ExecStart=/home/jorge/pimusic-backend/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pimusic-backend
+
+# Medidas de seguridad y aislamiento
+ProtectSystem=full
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
