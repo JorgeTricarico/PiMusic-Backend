@@ -963,14 +963,21 @@ async def stream_media(
             "-i", audio_url,
         ])
         cmd.extend([
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-af", "aresample=async=1000:first_pts=0"
+            "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
+            "-fps_mode", "passthrough",
         ])
     else:
-        cmd.extend(["-c:v", "copy"])
+        cmd.extend([
+            "-map", "0:v:0",
+            "-c:v", "copy",
+            "-fps_mode", "passthrough",
+        ])
 
     cmd.extend([
+        "-max_interleave_delta", "0",
         "-avoid_negative_ts", "make_zero",
         "-max_muxing_queue_size", "4096",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
