@@ -572,27 +572,59 @@ def extract_and_cache_info(url_or_id: str) -> dict:
 
 async def stream_media_process(cmd: list, chunk_size: int = CHUNK_SIZE, request: Optional[Request] = None):
     proc = None
+    reader_task = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
+
+        # Buffer en memoria: 256 chunks de 256KB = 64 MB de pre-buffer continuo.
+        # Desacopla la descarga de FFmpeg del consumo del cliente web/móvil para evitar bloqueos del socket.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+        async def _reader():
+            try:
+                while True:
+                    chunk = await proc.stdout.read(chunk_size)
+                    if not chunk:
+                        await queue.put(None)  # Señal EOF
+                        break
+                    await queue.put(chunk)
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
+            except Exception as e:
+                logger.debug(f"Reader task finalizado con excepción: {e}")
+                try:
+                    await queue.put(None)
+                except Exception:
+                    pass
+
+        reader_task = asyncio.create_task(_reader())
+
         while True:
             if request is not None and await request.is_disconnected():
                 logger.info("Cliente desconectado detectado mediante request.is_disconnected()")
                 break
-            chunk = await proc.stdout.read(chunk_size)
-            if not chunk:
+
+            chunk = await queue.get()
+            if chunk is None:
                 break
             yield chunk
+
+        if reader_task and not reader_task.done():
+            reader_task.cancel()
         await proc.wait()
+
     except (asyncio.CancelledError, GeneratorExit, BrokenPipeError, ConnectionResetError):
         logger.info("Cliente desconectado del stream. Limpiando subproceso...")
     except Exception as e:
         logger.error(f"Error en streaming: {e}")
         raise
     finally:
+        if reader_task and not reader_task.done():
+            reader_task.cancel()
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
