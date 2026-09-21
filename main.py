@@ -102,6 +102,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "Content-Type", "X-Media-Duration"],
 )
 
 # Compresión Gzip automática para respuestas JSON y texto (> 1000 bytes)
@@ -820,6 +821,8 @@ async def stream_media(
         logger.error(f"Error al extraer info de video para stream_media: {e}")
         raise HTTPException(status_code=404, detail=f"No se pudo resolver el stream: {e}")
 
+    duration_sec = str(data.get("duration_seconds") or 0)
+
     if quality == "audio":
         type = "audio"
 
@@ -847,7 +850,12 @@ async def stream_media(
             return StreamingResponse(
                 stream_media_process(cmd, chunk_size=CHUNK_SIZE),
                 status_code=200,
-                headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache",
+                    "X-Media-Duration": duration_sec,
+                    "Access-Control-Expose-Headers": "X-Media-Duration",
+                },
                 media_type="audio/mp4"
             )
 
@@ -874,7 +882,8 @@ async def stream_media(
             "Accept-Ranges": "bytes",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
-            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
+            "X-Media-Duration": duration_sec,
             "Cache-Control": "public, max-age=3600"
         }
         for h in ["Content-Range", "Content-Length", "Content-Type"]:
@@ -926,7 +935,8 @@ async def stream_media(
             "Accept-Ranges": "bytes",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
-            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
+            "X-Media-Duration": duration_sec,
             "Cache-Control": "public, max-age=3600"
         }
         for h in ["Content-Range", "Content-Length", "Content-Type"]:
@@ -1020,6 +1030,8 @@ async def stream_media(
         "Accept-Ranges": "none",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Access-Control-Expose-Headers": "X-Media-Duration",
+        "X-Media-Duration": duration_sec,
         "Cache-Control": "no-cache, no-store, must-revalidate",
     }
 
