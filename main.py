@@ -826,7 +826,7 @@ async def stream_media(
             headers["Range"] = range_header
 
         try:
-            upstream_resp = requests.get(target_url, headers=headers, stream=True, timeout=15)
+            upstream_resp = await asyncio.to_thread(requests.get, target_url, headers=headers, stream=True, timeout=15)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Error conectando con servidor de YouTube: {e}")
 
@@ -878,7 +878,7 @@ async def stream_media(
             headers["Range"] = range_header
 
         try:
-            upstream_resp = requests.get(target_url, headers=headers, stream=True, timeout=15)
+            upstream_resp = await asyncio.to_thread(requests.get, target_url, headers=headers, stream=True, timeout=15)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Error conectando con servidor de YouTube: {e}")
 
@@ -966,7 +966,7 @@ async def stream_media(
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
+            "-af", "aresample=async=1:first_pts=0",
             "-fps_mode", "passthrough",
         ])
     else:
@@ -978,9 +978,9 @@ async def stream_media(
 
     cmd.extend([
         "-max_interleave_delta", "0",
-        "-avoid_negative_ts", "make_zero",
+        "-copyts", "-start_at_zero", "-muxdelay", "0",
         "-max_muxing_queue_size", "4096",
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4", "-"
     ])
 
