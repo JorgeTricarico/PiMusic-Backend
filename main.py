@@ -651,18 +651,24 @@ class SaveServerRequest(BaseModel):
     title: Optional[str] = None
 
 class PlayRequest(BaseModel):
-    url: str
+    url: Optional[str] = ""
     title: Optional[str] = ""
-    format: Optional[str] = "AUDIO"
-    id: Optional[str] = None
+    format: Optional[str] = "video"
+    id: Optional[str] = ""
 
 class ControlRequest(BaseModel):
     action: str
     value: Optional[str] = ""
 
+class ActionRequest(BaseModel):
+    action: str
+
 class ResolveRequest(BaseModel):
-    url: str
-    format: Optional[str] = "AUDIO"
+    url: Optional[str] = ""
+    id: Optional[str] = ""
+    type: Optional[str] = None
+    format: Optional[str] = None
+    quality: Optional[str] = "480p"
 
 class TerminalRequest(BaseModel):
     command: str
@@ -1487,59 +1493,93 @@ def download_library_file(filename: str):
 
 @app.post("/api/resolve")
 def resolve_stream_url(req: ResolveRequest, request: Request):
-    req_format = (req.format or "AUDIO").strip().upper()
-    is_video = (req_format == "VIDEO")
-    v_id = extract_video_id(req.url)
+    raw_url = (req.url or "").strip()
+    v_id = req.id or extract_video_id(raw_url)
+    target = raw_url if raw_url.startswith("http") else f"https://www.youtube.com/watch?v={v_id}"
+    if not v_id:
+        v_id = extract_video_id(target)
+
+    media_type = (req.type or req.format or "video").strip().lower()
+    is_video = (media_type in ["video", "mp4"])
+    quality = (req.quality or "480p").lower()
 
     # 1. Intentar resolver desde extract_and_cache_info
     try:
-        cached = extract_and_cache_info(req.url)
+        cached = extract_and_cache_info(target)
+        title = cached.get("title", "")
         if is_video:
             prog_streams = cached.get("progressive_streams", {})
             # Priorizar flujos progresivos MP4 nativos multiplexados (video H264 + audio AAC en un único contenedor)
-            for pref_q in ["480p", "720p", "360p"]:
+            pref_keys = ["720p", "480p", "360p"] if "720" in quality else ["480p", "720p", "360p"]
+            for pref_q in pref_keys:
                 if pref_q in prog_streams and prog_streams[pref_q].get("url") and not (".m3u8" in prog_streams[pref_q]["url"].lower()):
+                    stream_url = prog_streams[pref_q]["url"]
                     return {
-                        "stream_url": prog_streams[pref_q]["url"],
-                        "title": cached.get("title", ""),
-                        "format": "video/mp4"
+                        "status": "ok",
+                        "stream_url": stream_url,
+                        "direct_url": stream_url,
+                        "url": stream_url,
+                        "title": title,
+                        "format": "mp4",
+                        "type": "video"
                     }
             for q, pdata in prog_streams.items():
                 if pdata.get("url") and not (".m3u8" in pdata["url"].lower()):
+                    stream_url = pdata["url"]
                     return {
-                        "stream_url": pdata["url"],
-                        "title": cached.get("title", ""),
-                        "format": "video/mp4"
+                        "status": "ok",
+                        "stream_url": stream_url,
+                        "direct_url": stream_url,
+                        "url": stream_url,
+                        "title": title,
+                        "format": "mp4",
+                        "type": "video"
                     }
         else:
             # AUDIO
             audio_url = cached.get("preview_audio_url")
             if audio_url and not (".m3u8" in audio_url.lower()):
                 return {
+                    "status": "ok",
                     "stream_url": audio_url,
-                    "title": cached.get("title", ""),
-                    "format": "audio/mp4"
+                    "direct_url": audio_url,
+                    "url": audio_url,
+                    "title": title,
+                    "format": "m4a",
+                    "type": "audio"
                 }
     except Exception as e:
         logger.warning(f"Advertencia resolviendo stream desde cache en /api/resolve: {e}")
 
     # 2. Resolución directa con yt-dlp usando los selectores óptimos para Android MediaPlayer
+    max_h = 480
+    if "720" in quality:
+        max_h = 720
+    elif "360" in quality:
+        max_h = 360
+    elif "1080" in quality:
+        max_h = 1080
+
     ydl_opts = get_ydl_base_opts()
     if is_video:
-        ydl_opts["format"] = "18/22/best[ext=mp4][height<=480]/best[ext=mp4]/best[vcodec!=none][acodec!=none]/best"
+        ydl_opts["format"] = f"18/22/best[ext=mp4][height<={max_h}]/best[height<={max_h}]/best[ext=mp4]/best[vcodec!=none][acodec!=none]/best"
     else:
         ydl_opts["format"] = "140/bestaudio[ext=m4a]/bestaudio/best"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
+            info = ydl.extract_info(target, download=False)
             url = info.get("url") or ""
             title = info.get("title", "")
             if url:
                 return {
+                    "status": "ok",
                     "stream_url": url,
+                    "direct_url": url,
+                    "url": url,
                     "title": title,
-                    "format": "video/mp4" if is_video else "audio/mp4"
+                    "format": info.get("ext") or ("mp4" if is_video else "m4a"),
+                    "type": "video" if is_video else "audio"
                 }
     except Exception as e:
         logger.warning(f"yt-dlp directo no encontró stream en /api/resolve: {e}")
@@ -1551,9 +1591,13 @@ def resolve_stream_url(req: ResolveRequest, request: Request):
     fallback_type = "video" if is_video else "audio"
     fallback_stream_url = f"{scheme}://{host}/api/stream_media/{v_id}?type={fallback_type}&quality=480p"
     return {
+        "status": "ok",
         "stream_url": fallback_stream_url,
+        "direct_url": fallback_stream_url,
+        "url": fallback_stream_url,
         "title": v_id,
-        "format": "video/mp4" if is_video else "audio/mp4"
+        "format": "mp4" if is_video else "m4a",
+        "type": fallback_type
     }
 
 
@@ -1599,21 +1643,25 @@ def get_player_status():
 @app.post("/api/play")
 def play_on_server(req: PlayRequest, bg_tasks: BackgroundTasks):
     global SERVER_PLAYER_STATE, MPV_PROCESS
+    raw_url = (req.url or "").strip()
+    v_id = req.id or extract_video_id(raw_url)
+    target = raw_url if raw_url.startswith("http") else f"https://www.youtube.com/watch?v={v_id}"
+
     SERVER_PLAYER_STATE["state"] = "playing"
-    SERVER_PLAYER_STATE["current_track"] = req.title or req.url
-    SERVER_PLAYER_STATE["url"] = req.url
-    SERVER_PLAYER_STATE["format"] = req.format or "AUDIO"
+    SERVER_PLAYER_STATE["current_track"] = req.title or target
+    SERVER_PLAYER_STATE["url"] = target
+    SERVER_PLAYER_STATE["format"] = req.format or "video"
 
     # Iniciar reproducción por hardware en la Raspberry Pi si MPV está disponible
     if shutil.which("mpv"):
         stop_server_player()
-        is_audio = (req.format or "").strip().upper() == "AUDIO"
+        is_audio = (req.format or "").strip().lower() in ["audio", "mp3"]
         mpv_cmd = ["mpv", "--no-terminal", "--idle=no"]
         if is_audio:
             mpv_cmd.append("--no-video")
         else:
             mpv_cmd.append("--fs")
-        mpv_cmd.append(req.url)
+        mpv_cmd.append(target)
         try:
             with MPV_LOCK:
                 MPV_PROCESS = subprocess.Popen(
@@ -1621,21 +1669,22 @@ def play_on_server(req: PlayRequest, bg_tasks: BackgroundTasks):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
-            logger.info(f"MPV iniciado para {req.url} (audio={is_audio})")
+            logger.info(f"MPV iniciado para {target} (audio={is_audio})")
         except Exception as pe:
             logger.warning(f"No se pudo iniciar MPV en Raspberry Pi: {pe}")
 
     # Caching automático de la pista en segundo plano para reproducciones instantáneas futuras
-    bg_tasks.add_task(cache_played_track, req.url, req.title, req.format)
+    bg_tasks.add_task(cache_played_track, target, req.title, req.format)
 
     return {
-        "status": "success",
-        "message": "Reproduciendo...",
+        "status": "ok",
+        "message": f"Reproduciendo {target}",
         "track": SERVER_PLAYER_STATE["current_track"]
     }
 
 
 @app.post("/api/control")
+@app.post("/api/playback/action")
 def control_player(req: ControlRequest):
     global SERVER_PLAYER_STATE, MPV_PROCESS
     action = (req.action or "").lower().strip()
@@ -1656,7 +1705,22 @@ def control_player(req: ControlRequest):
                 os.kill(MPV_PROCESS.pid, signal.SIGCONT)
             except Exception:
                 pass
-    return {"status": "success", "state": SERVER_PLAYER_STATE["state"]}
+    elif action == "toggle":
+        if SERVER_PLAYER_STATE["state"] == "playing":
+            SERVER_PLAYER_STATE["state"] = "paused"
+            if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
+                try:
+                    os.kill(MPV_PROCESS.pid, signal.SIGSTOP)
+                except Exception:
+                    pass
+        else:
+            SERVER_PLAYER_STATE["state"] = "playing"
+            if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
+                try:
+                    os.kill(MPV_PROCESS.pid, signal.SIGCONT)
+                except Exception:
+                    pass
+    return {"status": "ok", "state": SERVER_PLAYER_STATE["state"]}
 
 
 @app.get("/api/telemetry")
@@ -1685,12 +1749,25 @@ def get_telemetry():
         uptime_seconds = int(time.time() - psutil.boot_time())
         uptime_str = format_duration(uptime_seconds)
 
+        model_name = "Raspberry Pi"
+        try:
+            if os.path.exists("/proc/device-tree/model"):
+                with open("/proc/device-tree/model", "r", encoding="utf-8") as f:
+                    model_name = f.read().strip("\x00 \n\r")
+        except Exception:
+            pass
+
+        cpu_val = round(float(cpu_percent), 1)
+
         return {
-            "model": "PiMusic Server Host",
-            "cpu": f"{cpu_percent}%",
+            "model": model_name,
+            "cpu": f"{cpu_val}%",
+            "cpu_percent": cpu_val,
             "temp": temp_str,
             "ram": f"{mem.percent}% | {int(mem.used / (1024*1024))}/{int(mem.total / (1024*1024))}MB",
+            "ram_percent": round(mem.percent, 1),
             "disk": f"{disk.percent}%",
+            "disk_percent": round(disk.percent, 1),
             "uptime": uptime_str,
             "disk_free_gb": round(disk.free / (1024**3), 1),
             "disk_total_gb": round(disk.total / (1024**3), 1),
