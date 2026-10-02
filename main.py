@@ -17,7 +17,8 @@ import logging.handlers
 import asyncio
 import subprocess
 import signal
-from typing import Optional, List, Dict, Any, Tuple
+import urllib.parse
+from typing import Optional, List, Dict, Any, Tuple, Union
 from collections import OrderedDict
 from threading import Lock
 from pathlib import Path
@@ -64,8 +65,8 @@ cors_raw = os.getenv("PIMUSIC_CORS_ORIGINS", os.getenv("CORS_ORIGINS", "*")).str
 CORS_ORIGINS = [o.strip() for o in cors_raw.split(",") if o.strip()] if cors_raw != "*" else ["*"]
 
 ALLOWED_MEDIA_EXTENSIONS = {
-    "mp4", "m4v", "mkv", "webm", "mov", "avi", "flv", "wmv",
-    "mp3", "m4a", "aac", "ogg", "opus", "wav", "flac", "weba"
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "flv", "wmv", "3gp", "ts",
+    "mp3", "m4a", "aac", "ogg", "opus", "wav", "flac", "weba", "wma", "m4b", "aiff", "alac"
 }
 
 # Configuración de Logging Persistente con Rotación (10 MB x 5 backups)
@@ -93,6 +94,16 @@ for uvicorn_log in ["uvicorn", "uvicorn.error", "uvicorn.access"]:
 
 logger = logging.getLogger("PiMusicServer")
 logger.info("Iniciando servicio PiMusic Server con registro persistente en: %s", LOG_FILE)
+
+# Configuración de Logging de Telemetría para la Aplicación Android (app_telemetry.log)
+APP_LOG_FILE = Path(os.getenv("PIMUSIC_APP_LOG_FILE", "app_telemetry.log")).resolve()
+app_logger = logging.getLogger("PiMusicApp")
+app_handler = logging.handlers.RotatingFileHandler(
+    str(APP_LOG_FILE), maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+app_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+app_logger.addHandler(app_handler)
+app_logger.setLevel(logging.INFO)
 
 app = FastAPI(title="PiMusic High-Performance API", version="3.0.0")
 
@@ -256,6 +267,10 @@ search_cache = MediaMetadataCache(max_entries=64, ttl=1800)
 # =====================================================================
 
 def get_ydl_base_opts() -> dict:
+    clients_env = os.getenv("YTDL_PLAYER_CLIENTS", "visionos,web,android").strip()
+    player_clients = [c.strip() for c in clients_env.split(",") if c.strip() and c.strip().lower() not in ("android_vr", "vr")]
+    if not player_clients:
+        player_clients = ["visionos", "web", "android"]
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -263,7 +278,7 @@ def get_ydl_base_opts() -> dict:
         "noplaylist": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "android", "web"]
+                "player_client": player_clients
             }
         }
     }
@@ -322,6 +337,11 @@ def extract_and_cache_info(url_or_id: str) -> dict:
                 status_code=403,
                 detail="Video con restricción de edad. Requiere inicio de sesión o cookies."
             )
+        elif "403" in msg or "forbidden" in msg:
+            raise HTTPException(
+                status_code=403,
+                detail="YouTube ha denegado el acceso al video (403 Forbidden). Requiere cookies válidas o actualización de cliente."
+            )
         elif "private" in msg or "unavailable" in msg:
             raise HTTPException(status_code=404, detail="El video es privado o no está disponible.")
         else:
@@ -358,6 +378,10 @@ def extract_and_cache_info(url_or_id: str) -> dict:
     for f in raw_formats:
         f_url = f.get("url")
         if not f_url or not f_url.startswith("http"):
+            continue
+
+        # Descartar flujos de ANDROID_VR por exigir GVS PO Token (causa 403 Forbidden en YouTube)
+        if "c=android_vr" in f_url.lower():
             continue
 
         vcodec = f.get("vcodec", "none") or "none"
@@ -611,10 +635,6 @@ async def stream_media_process(cmd: list, chunk_size: int = CHUNK_SIZE, request:
         reader_task = asyncio.create_task(_reader())
 
         while True:
-            if request is not None and await request.is_disconnected():
-                logger.info("Cliente desconectado detectado mediante request.is_disconnected()")
-                break
-
             chunk = await queue.get()
             if chunk is None:
                 break
@@ -652,13 +672,16 @@ class SaveServerRequest(BaseModel):
 
 class PlayRequest(BaseModel):
     url: Optional[str] = ""
-    title: Optional[str] = ""
-    format: Optional[str] = "video"
+    title: Optional[str] = "Pista"
+    track_id: Optional[str] = ""
     id: Optional[str] = ""
+    format: Optional[str] = "VIDEO"  # "VIDEO" o "AUDIO"
+    target_device: Optional[str] = "rpi5"  # "rpi5" o "rpi3"
+    quality: Optional[str] = "best"  # "best", "720p", "480p", "low"
 
 class ControlRequest(BaseModel):
-    action: str
-    value: Optional[str] = ""
+    action: str  # pause, play, resume, toggle, stop, seek, volume, next, prev
+    value: Optional[str] = None
 
 class ActionRequest(BaseModel):
     action: str
@@ -673,29 +696,87 @@ class ResolveRequest(BaseModel):
 class TerminalRequest(BaseModel):
     command: str
 
+class DeleteFileRequest(BaseModel):
+    filename: str
+
 SERVER_PLAYER_STATE = {
     "state": "idle",
     "current_track": "",
     "url": "",
-    "format": "AUDIO",
+    "format": "VIDEO",
+    "volume": 100.0,
 }
 
+CURRENT_MPV_PROCESS: Optional[subprocess.Popen] = None
 MPV_PROCESS: Optional[subprocess.Popen] = None
+IS_PAUSED: bool = False
 MPV_LOCK = Lock()
+MPV_SOCKET = os.getenv("PIMUSIC_MPV_SOCKET", "/tmp/mpvsocket")
+
+def send_mpv_command(command_list: list) -> dict:
+    """Envía un comando JSON IPC al socket Unix de MPV."""
+    if not hasattr(socket, "AF_UNIX"):
+        return {"status": "error", "message": "AF_UNIX no disponible en esta plataforma"}
+    if not os.path.exists(MPV_SOCKET):
+        return {"status": "error", "message": "MPV socket not active"}
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(1.5)
+        client.connect(MPV_SOCKET)
+        payload = json.dumps({"command": command_list}) + "\n"
+        client.sendall(payload.encode("utf-8"))
+        raw_response = client.recv(2048)
+        client.close()
+        if raw_response:
+            return json.loads(raw_response.decode("utf-8"))
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def is_rpi3_or_legacy() -> bool:
+    """Detecta si el hardware es una Raspberry Pi 3 o anterior con recursos limitados."""
+    try:
+        if os.path.exists("/proc/device-tree/model"):
+            with open("/proc/device-tree/model", "r", encoding="utf-8") as f:
+                model = f.read().lower()
+                if any(k in model for k in ["pi 3", "pi 2", "pi 1", "zero", "model 3"]):
+                    return True
+    except Exception:
+        pass
+    try:
+        if psutil.virtual_memory().total <= 1.2 * 1024 * 1024 * 1024:
+            return True
+    except Exception:
+        pass
+    return False
 
 def stop_server_player():
-    global MPV_PROCESS
+    global CURRENT_MPV_PROCESS, MPV_PROCESS, IS_PAUSED, SERVER_PLAYER_STATE
+    if hasattr(socket, "AF_UNIX") and os.path.exists(MPV_SOCKET):
+        try:
+            send_mpv_command(["quit"])
+        except Exception:
+            pass
     with MPV_LOCK:
-        if MPV_PROCESS:
-            try:
-                MPV_PROCESS.terminate()
-                MPV_PROCESS.wait(timeout=2)
-            except Exception:
+        for proc in [CURRENT_MPV_PROCESS, MPV_PROCESS]:
+            if proc:
                 try:
-                    MPV_PROCESS.kill()
+                    proc.terminate()
+                    proc.wait(timeout=2)
                 except Exception:
-                    pass
-            MPV_PROCESS = None
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        CURRENT_MPV_PROCESS = None
+        MPV_PROCESS = None
+    if os.path.exists(MPV_SOCKET):
+        try:
+            os.remove(MPV_SOCKET)
+        except Exception:
+            pass
+    IS_PAUSED = False
+    SERVER_PLAYER_STATE["state"] = "idle"
 
 def cache_played_track(url: str, title: Optional[str] = None, format_type: Optional[str] = "AUDIO"):
     """Guarda automáticamente la pista reproducida en el almacenamiento local para reanudación instantánea."""
@@ -928,45 +1009,77 @@ async def stream_media(
                 media_type="audio/mp4"
             )
 
-        # Si es un flujo directo HTTP/HTTPS, usar Proxy Range 206
+        # Si es un flujo directo HTTP/HTTPS, usar Proxy Range 206 con fallback ante 403
         headers = {"User-Agent": target_ua, "Accept": "*/*"}
         range_header = request.headers.get("range")
         if range_header:
             headers["Range"] = range_header
 
+        use_direct_proxy = True
         try:
             upstream_resp = await asyncio.to_thread(requests.get, target_url, headers=headers, stream=True, timeout=15)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Error conectando con servidor de YouTube: {e}")
-
-        def iter_audio():
-            try:
-                for chunk in upstream_resp.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
+            if upstream_resp.status_code in (403, 404, 410):
                 upstream_resp.close()
+                logger.warning(f"YouTube devolvió {upstream_resp.status_code} en stream directo de audio para {video_id}. Pasando a FFmpeg...")
+                media_cache.set(video_id, None)
+                use_direct_proxy = False
+        except Exception as e:
+            logger.warning(f"Error conectando con upstream de audio ({e}), pasando a FFmpeg...")
+            use_direct_proxy = False
 
-        response_headers = {
-            "Accept-Ranges": "bytes",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
-            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
-            "X-Media-Duration": duration_sec,
-            "Cache-Control": "public, max-age=3600"
-        }
-        for h in ["Content-Range", "Content-Length", "Content-Type"]:
-            if h in upstream_resp.headers:
-                response_headers[h] = upstream_resp.headers[h]
-            elif h.lower() in upstream_resp.headers:
-                response_headers[h] = upstream_resp.headers[h.lower()]
+        if use_direct_proxy:
+            def iter_audio():
+                try:
+                    for chunk in upstream_resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            yield chunk
+                finally:
+                    upstream_resp.close()
 
-        return StreamingResponse(
-            iter_audio(),
-            status_code=upstream_resp.status_code,
-            headers=response_headers,
-            media_type=response_headers.get("Content-Type", "audio/mp4")
-        )
+            response_headers = {
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
+                "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
+                "X-Media-Duration": duration_sec,
+                "Cache-Control": "public, max-age=3600"
+            }
+            for h in ["Content-Range", "Content-Length", "Content-Type"]:
+                if h in upstream_resp.headers:
+                    response_headers[h] = upstream_resp.headers[h]
+                elif h.lower() in upstream_resp.headers:
+                    response_headers[h] = upstream_resp.headers[h.lower()]
+
+            return StreamingResponse(
+                iter_audio(),
+                status_code=upstream_resp.status_code,
+                headers=response_headers,
+                media_type=response_headers.get("Content-Type", "audio/mp4")
+            )
+        else:
+            # Fallback resiliente a FFmpeg para audio
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if start > 0:
+                cmd.extend(["-ss", str(start)])
+            cmd.extend([
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                "-user_agent", target_ua,
+                "-i", target_url,
+                "-c:a", "copy",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", "-"
+            ])
+            return StreamingResponse(
+                stream_media_process(cmd, chunk_size=CHUNK_SIZE, request=request),
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache",
+                    "X-Media-Duration": duration_sec,
+                    "Access-Control-Expose-Headers": "X-Media-Duration",
+                },
+                media_type="audio/mp4"
+            )
 
     # =========================================================================
     # B) MODO VIDEO
@@ -989,37 +1102,41 @@ async def stream_media(
 
         try:
             upstream_resp = await asyncio.to_thread(requests.get, target_url, headers=headers, stream=True, timeout=15)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Error conectando con servidor de YouTube: {e}")
-
-        def iter_video():
-            try:
-                for chunk in upstream_resp.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
+            if upstream_resp.status_code in (403, 404, 410):
                 upstream_resp.close()
+                logger.warning(f"YouTube devolvió {upstream_resp.status_code} en stream directo progresivo para {video_id}. Pasando a remuxing FFmpeg...")
+                media_cache.set(video_id, None)
+            else:
+                def iter_video():
+                    try:
+                        for chunk in upstream_resp.iter_content(chunk_size=64 * 1024):
+                            if chunk:
+                                yield chunk
+                    finally:
+                        upstream_resp.close()
 
-        response_headers = {
-            "Accept-Ranges": "bytes",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
-            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
-            "X-Media-Duration": duration_sec,
-            "Cache-Control": "public, max-age=3600"
-        }
-        for h in ["Content-Range", "Content-Length", "Content-Type"]:
-            if h in upstream_resp.headers:
-                response_headers[h] = upstream_resp.headers[h]
-            elif h.lower() in upstream_resp.headers:
-                response_headers[h] = upstream_resp.headers[h.lower()]
+                response_headers = {
+                    "Accept-Ranges": "bytes",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Range, Content-Range, Accept-Ranges, Content-Type",
+                    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, X-Media-Duration",
+                    "X-Media-Duration": duration_sec,
+                    "Cache-Control": "public, max-age=3600"
+                }
+                for h in ["Content-Range", "Content-Length", "Content-Type"]:
+                    if h in upstream_resp.headers:
+                        response_headers[h] = upstream_resp.headers[h]
+                    elif h.lower() in upstream_resp.headers:
+                        response_headers[h] = upstream_resp.headers[h.lower()]
 
-        return StreamingResponse(
-            iter_video(),
-            status_code=upstream_resp.status_code,
-            headers=response_headers,
-            media_type="video/mp4"
-        )
+                return StreamingResponse(
+                    iter_video(),
+                    status_code=upstream_resp.status_code,
+                    headers=response_headers,
+                    media_type="video/mp4"
+                )
+        except Exception as e:
+            logger.warning(f"Error conectando con upstream de video ({e}), pasando a remuxing FFmpeg...")
 
     # 2. Si no es progresivo directo (DASH separado o HLS): Remuxing Live a fMP4 con FFmpeg
     plans = data.get("video_plans", {})
@@ -1089,9 +1206,10 @@ async def stream_media(
 
     cmd.extend([
         "-max_interleave_delta", "0",
-        "-copyts", "-start_at_zero", "-muxdelay", "0",
+        "-avoid_negative_ts", "make_zero",
+        "-muxdelay", "0",
         "-max_muxing_queue_size", "4096",
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
         "-f", "mp4", "-"
     ])
 
@@ -1117,6 +1235,7 @@ async def stream_media(
 # =====================================================================
 
 @app.get("/api/download")
+@app.get("/api/download_stream")
 async def download_direct(
     url: str = Query(...),
     type: str = Query("video", pattern="^(video|audio)$"),
@@ -1165,7 +1284,7 @@ async def download_direct(
     else:
         ext = "mp4"
         media_type = "video/mp4"
-        plan = cached["video_plans"].get(quality) or cached["video_plans"].get("720p") or {}
+        plan = cached["video_plans"].get(quality) or cached["video_plans"].get("720p") or (next(iter(cached["video_plans"].values())) if cached.get("video_plans") else {})
 
         if plan.get("mode") == "progressive":
             cmd = [
@@ -1182,16 +1301,17 @@ async def download_direct(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-avoid_negative_ts", "make_zero",
                 "-fflags", "+genpts",
-                "-max_muxing_queue_size", "4096",
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-user_agent", plan.get("video_ua", DEFAULT_USER_AGENT),
                 "-i", plan["video_url"],
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-user_agent", plan.get("audio_ua", DEFAULT_USER_AGENT),
                 "-i", plan["audio_url"],
+                "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
                 "-af", "aresample=async=1000:first_pts=0",
+                "-max_muxing_queue_size", "4096",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
                 "-f", "mp4", "-"
             ]
@@ -1200,36 +1320,40 @@ async def download_direct(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-avoid_negative_ts", "make_zero",
                 "-fflags", "+genpts",
-                "-max_muxing_queue_size", "4096",
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-user_agent", plan.get("video_ua", DEFAULT_USER_AGENT),
                 "-i", plan["video_url"],
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-user_agent", plan.get("audio_ua", DEFAULT_USER_AGENT),
                 "-i", plan["audio_url"],
+                "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                 "-c:a", "aac", "-b:a", "192k",
                 "-af", "aresample=async=1000:first_pts=0",
+                "-max_muxing_queue_size", "4096",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
                 "-f", "mp4", "-"
             ]
         else:
             v_url = plan.get("video_url") or plan.get("url") or cached["preview_video_url"]
             a_url = plan.get("audio_url") or cached["preview_audio_url"]
+            v_ua = plan.get("video_ua") or cached.get("preview_video_ua") or DEFAULT_USER_AGENT
+            a_ua = plan.get("audio_ua") or cached.get("preview_audio_ua") or DEFAULT_USER_AGENT
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-avoid_negative_ts", "make_zero",
                 "-fflags", "+genpts",
-                "-max_muxing_queue_size", "4096",
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-user_agent", DEFAULT_USER_AGENT,
+                "-user_agent", v_ua,
                 "-i", v_url,
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-user_agent", DEFAULT_USER_AGENT,
+                "-user_agent", a_ua,
                 "-i", a_url,
+                "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
                 "-af", "aresample=async=1000:first_pts=0",
+                "-max_muxing_queue_size", "4096",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
                 "-f", "mp4", "-"
             ]
@@ -1252,14 +1376,16 @@ async def download_direct(
 # =====================================================================
 
 @app.post("/api/save-server")
+@app.post("/api/download_to_server")
 def save_to_server(req: SaveServerRequest, bg_tasks: BackgroundTasks):
     def run_download():
         target_path = DOWNLOADS_DIR / "%(title)s.%(ext)s"
         ydl_opts = {
+            **get_ydl_base_opts(),
             "outtmpl": str(target_path),
+            "skip_download": False,
             "quiet": True,
             "no_warnings": True,
-            **get_ydl_base_opts()
         }
         if req.format_type == "audio":
             if req.quality == "m4a":
@@ -1375,45 +1501,121 @@ def get_library():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Directorios donde se almacenan las descargas y música en la Pi (Pi 5 y Pi 3)
+MEDIA_DIRS = [
+    DOWNLOADS_DIR,
+    Path("downloads"),
+    Path("music"),
+    Path.home() / "Music",
+    Path.home() / "downloads",
+    Path.home() / "pi-music-cache",
+    Path(".")
+]
+
+def find_media_file(filename: str) -> Optional[Path]:
+    """Busca el archivo físico decodificando espacios y evitando path traversal."""
+    decoded = urllib.parse.unquote_plus(filename).strip()
+    if "?" in decoded:
+        decoded = decoded.split("?")[0].strip()
+    if "#" in decoded:
+        decoded = decoded.split("#")[0].strip()
+    clean_name = os.path.basename(decoded)
+    if not clean_name or clean_name in (".", ".."):
+        return None
+
+    # Primero verificar en DOWNLOADS_DIR y luego en todos los directorios multimedia
+    search_dirs = [DOWNLOADS_DIR] + [d for d in MEDIA_DIRS if d != DOWNLOADS_DIR]
+    seen_targets = set()
+    for base_dir in search_dirs:
+        try:
+            b_path = Path(base_dir).resolve()
+            if b_path.exists():
+                target = (b_path / clean_name).resolve()
+                if str(target) in seen_targets:
+                    continue
+                seen_targets.add(str(target))
+                # Verificación estricta contra path traversal
+                try:
+                    target.relative_to(b_path)
+                except ValueError:
+                    continue
+                if target.is_file():
+                    return target
+
+                # Si no tiene extensión en la petición, buscar archivo existente con extensión permitida
+                if "." not in clean_name:
+                    for ext in ALLOWED_MEDIA_EXTENSIONS:
+                        candidate = (b_path / f"{clean_name}.{ext}").resolve()
+                        if candidate.is_file():
+                            try:
+                                candidate.relative_to(b_path)
+                                return candidate
+                            except ValueError:
+                                continue
+        except Exception:
+            continue
+    return None
+
+
+# 1. Endpoint DELETE
 @app.delete("/api/library/{filename:path}")
-def delete_library_file(filename: str):
+async def delete_library_file_path(filename: str):
     """
     Elimina un archivo de la biblioteca de la Raspberry Pi de forma segura con protección anti path-traversal.
     """
+    decoded = urllib.parse.unquote_plus(filename).strip()
+    if "?" in decoded:
+        decoded = decoded.split("?")[0].strip()
+    if "#" in decoded:
+        decoded = decoded.split("#")[0].strip()
+    clean_name = os.path.basename(decoded)
+    if not clean_name or clean_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
+
+    req_ext = clean_name.rsplit(".", 1)[-1].lower() if "." in clean_name else ""
+    if req_ext and req_ext not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
+
+    file_path = find_media_file(filename)
+    if not file_path or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {filename}")
+
+    actual_ext = file_path.name.rsplit(".", 1)[-1].lower() if "." in file_path.name else ""
+    if actual_ext not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
+
     try:
-        clean_name = os.path.basename(filename.strip())
-        if not clean_name or clean_name in (".", ".."):
-            raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
-
-        file_path = (DOWNLOADS_DIR / clean_name).resolve()
-        try:
-            file_path.relative_to(DOWNLOADS_DIR.resolve())
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Acceso no permitido fuera del directorio de descargas")
-
-        ext = file_path.suffix.lower().lstrip(".")
-        if ext not in ALLOWED_MEDIA_EXTENSIONS:
-            raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
-
-        if not file_path.exists() or not file_path.is_file():
-            raise HTTPException(status_code=404, detail="Archivo no encontrado")
-
-        file_path.unlink()
+        os.remove(file_path)
         # Eliminar archivo temporal residual .part si existe
         part_path = file_path.with_name(f"{file_path.name}.part")
         if part_path.exists():
             try:
-                part_path.unlink()
+                os.remove(part_path)
             except Exception:
                 pass
 
-        logger.info(f"Archivo eliminado de la biblioteca: {clean_name}")
-        return {"status": "deleted", "filename": clean_name}
-    except HTTPException:
-        raise
+        logger.info(f"Archivo eliminado de la biblioteca: {file_path.name}")
+        return {
+            "status": "ok",
+            "message": "Archivo eliminado con éxito",
+            "filename": filename,
+            "deleted": True
+        }
     except Exception as e:
         logger.error(f"Error eliminando archivo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Alias para compatibilidad con código existente
+delete_library_file = delete_library_file_path
+
+
+# 2. Endpoint POST (alternativa)
+@app.post("/api/library/delete")
+async def delete_library_file_post(payload: DeleteFileRequest):
+    """
+    Endpoint alternativo POST para eliminar archivos de la biblioteca mediante payload JSON.
+    """
+    return await delete_library_file_path(payload.filename)
 
 
 @app.get("/api/library/stream/{filename:path}")
@@ -1421,24 +1623,28 @@ def stream_library_file(filename: str, request: Request):
     """
     Transmite un archivo local con soporte completo para HTTP Range 206 y seeking instantáneo.
     """
-    clean_name = os.path.basename(filename.strip())
+    decoded = urllib.parse.unquote_plus(filename).strip()
+    if "?" in decoded:
+        decoded = decoded.split("?")[0].strip()
+    if "#" in decoded:
+        decoded = decoded.split("#")[0].strip()
+    clean_name = os.path.basename(decoded)
     if not clean_name or clean_name in (".", ".."):
         raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
 
-    file_path = (DOWNLOADS_DIR / clean_name).resolve()
-    try:
-        file_path.relative_to(DOWNLOADS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Acceso no permitido fuera del directorio de descargas")
-
-    ext = file_path.suffix.lower().lstrip(".")
-    if ext not in ALLOWED_MEDIA_EXTENSIONS:
+    req_ext = clean_name.rsplit(".", 1)[-1].lower() if "." in clean_name else ""
+    if req_ext and req_ext not in ALLOWED_MEDIA_EXTENSIONS:
         raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
 
-    if not file_path.exists() or not file_path.is_file():
+    file_path = find_media_file(filename)
+    if not file_path or not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
-    media_type = get_media_mime_type(ext)
+    actual_ext = file_path.name.rsplit(".", 1)[-1].lower() if "." in file_path.name else ""
+    if actual_ext not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
+
+    media_type = get_media_mime_type(actual_ext)
 
     response_headers = {
         "Accept-Ranges": "bytes",
@@ -1460,33 +1666,37 @@ def download_library_file(filename: str):
     """
     Devuelve FileResponse con Content-Disposition: attachment; filename="...".
     """
-    clean_name = os.path.basename(filename.strip())
+    decoded = urllib.parse.unquote_plus(filename).strip()
+    if "?" in decoded:
+        decoded = decoded.split("?")[0].strip()
+    if "#" in decoded:
+        decoded = decoded.split("#")[0].strip()
+    clean_name = os.path.basename(decoded)
     if not clean_name or clean_name in (".", ".."):
         raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
 
-    file_path = (DOWNLOADS_DIR / clean_name).resolve()
-    try:
-        file_path.relative_to(DOWNLOADS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Acceso no permitido fuera del directorio de descargas")
-
-    ext = file_path.suffix.lower().lstrip(".")
-    if ext not in ALLOWED_MEDIA_EXTENSIONS:
+    req_ext = clean_name.rsplit(".", 1)[-1].lower() if "." in clean_name else ""
+    if req_ext and req_ext not in ALLOWED_MEDIA_EXTENSIONS:
         raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
 
-    if not file_path.exists() or not file_path.is_file():
+    file_path = find_media_file(filename)
+    if not file_path or not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
-    media_type = get_media_mime_type(ext)
+    actual_ext = file_path.name.rsplit(".", 1)[-1].lower() if "." in file_path.name else ""
+    if actual_ext not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="Acceso denegado: solo se admiten archivos multimedia")
+
+    media_type = get_media_mime_type(actual_ext)
 
     return FileResponse(
         path=file_path,
-        filename=clean_name,
+        filename=file_path.name,
         media_type=media_type,
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-            "Content-Disposition": f'attachment; filename="{clean_name}"'
+            "Content-Disposition": f'attachment; filename="{file_path.name}"'
         }
     )
 
@@ -1503,101 +1713,57 @@ def resolve_stream_url(req: ResolveRequest, request: Request):
     is_video = (media_type in ["video", "mp4"])
     quality = (req.quality or "480p").lower()
 
-    # 1. Intentar resolver desde extract_and_cache_info
+    host = request.headers.get("host") or f"{HOST}:{PORT}"
+    scheme = request.headers.get("x-forwarded-proto") or (request.url.scheme if hasattr(request, "url") and request.url.scheme else "http")
+
+    # 1. Comprobar si es un archivo local en la biblioteca
+    local_file = find_media_file(raw_url or v_id)
+    if local_file:
+        encoded_name = urllib.parse.quote(local_file.name)
+        local_url = f"{scheme}://{host}/api/library/stream/{encoded_name}"
+        return {
+            "status": "ok",
+            "stream_url": local_url,
+            "direct_url": local_url,
+            "url": local_url,
+            "server_url": local_url,
+            "title": local_file.stem,
+            "format": local_file.suffix.replace(".", "") or ("mp4" if is_video else "mp3"),
+            "type": "video" if local_file.suffix.lower() in (".mp4", ".mkv", ".webm") else "audio",
+            "is_local": True
+        }
+
+    # 2. Para YouTube: Servir SIEMPRE a través del proxy del backend (/api/stream_media/{v_id}).
+    # Esto elimina el error HTTP 403 Forbidden de raíz, ya que las URLs directas de GoogleVideo
+    # están firmadas criptográficamente para la dirección IP del servidor (&ip=...) y fallan si
+    # la aplicación Android intenta abrirlas directamente desde otra IP o red móvil.
+    title = v_id
+    duration = "0:00"
+    duration_sec = 0
+
     try:
         cached = extract_and_cache_info(target)
-        title = cached.get("title", "")
-        if is_video:
-            prog_streams = cached.get("progressive_streams", {})
-            # Priorizar flujos progresivos MP4 nativos multiplexados (video H264 + audio AAC en un único contenedor)
-            pref_keys = ["720p", "480p", "360p"] if "720" in quality else ["480p", "720p", "360p"]
-            for pref_q in pref_keys:
-                if pref_q in prog_streams and prog_streams[pref_q].get("url") and not (".m3u8" in prog_streams[pref_q]["url"].lower()):
-                    stream_url = prog_streams[pref_q]["url"]
-                    return {
-                        "status": "ok",
-                        "stream_url": stream_url,
-                        "direct_url": stream_url,
-                        "url": stream_url,
-                        "title": title,
-                        "format": "mp4",
-                        "type": "video"
-                    }
-            for q, pdata in prog_streams.items():
-                if pdata.get("url") and not (".m3u8" in pdata["url"].lower()):
-                    stream_url = pdata["url"]
-                    return {
-                        "status": "ok",
-                        "stream_url": stream_url,
-                        "direct_url": stream_url,
-                        "url": stream_url,
-                        "title": title,
-                        "format": "mp4",
-                        "type": "video"
-                    }
-        else:
-            # AUDIO
-            audio_url = cached.get("preview_audio_url")
-            if audio_url and not (".m3u8" in audio_url.lower()):
-                return {
-                    "status": "ok",
-                    "stream_url": audio_url,
-                    "direct_url": audio_url,
-                    "url": audio_url,
-                    "title": title,
-                    "format": "m4a",
-                    "type": "audio"
-                }
+        title = cached.get("title", v_id)
+        duration = cached.get("duration", "0:00")
+        duration_sec = cached.get("duration_seconds", 0)
     except Exception as e:
-        logger.warning(f"Advertencia resolviendo stream desde cache en /api/resolve: {e}")
+        logger.warning(f"Advertencia al resolver metadatos en /api/resolve: {e}")
 
-    # 2. Resolución directa con yt-dlp usando los selectores óptimos para Android MediaPlayer
-    max_h = 480
-    if "720" in quality:
-        max_h = 720
-    elif "360" in quality:
-        max_h = 360
-    elif "1080" in quality:
-        max_h = 1080
+    stream_type = "video" if is_video else "audio"
+    server_stream_url = f"{scheme}://{host}/api/stream_media/{v_id}?type={stream_type}&quality={quality}"
 
-    ydl_opts = get_ydl_base_opts()
-    if is_video:
-        ydl_opts["format"] = f"18/22/best[ext=mp4][height<={max_h}]/best[height<={max_h}]/best[ext=mp4]/best[vcodec!=none][acodec!=none]/best"
-    else:
-        ydl_opts["format"] = "140/bestaudio[ext=m4a]/bestaudio/best"
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-            url = info.get("url") or ""
-            title = info.get("title", "")
-            if url:
-                return {
-                    "status": "ok",
-                    "stream_url": url,
-                    "direct_url": url,
-                    "url": url,
-                    "title": title,
-                    "format": info.get("ext") or ("mp4" if is_video else "m4a"),
-                    "type": "video" if is_video else "audio"
-                }
-    except Exception as e:
-        logger.warning(f"yt-dlp directo no encontró stream en /api/resolve: {e}")
-
-    # 3. Fallback de alta resiliencia para Android MediaPlayer / ExoPlayer:
-    # Servir a través del endpoint remuxeado por el propio servidor de la Raspberry Pi
-    host = request.headers.get("host") or f"{HOST}:{PORT}"
-    scheme = request.url.scheme if hasattr(request, "url") and request.url.scheme else "http"
-    fallback_type = "video" if is_video else "audio"
-    fallback_stream_url = f"{scheme}://{host}/api/stream_media/{v_id}?type={fallback_type}&quality=480p"
     return {
         "status": "ok",
-        "stream_url": fallback_stream_url,
-        "direct_url": fallback_stream_url,
-        "url": fallback_stream_url,
-        "title": v_id,
+        "stream_url": server_stream_url,
+        "direct_url": server_stream_url,
+        "url": server_stream_url,
+        "server_url": server_stream_url,
+        "video_id": v_id,
+        "title": title,
+        "duration": duration,
+        "duration_seconds": duration_sec,
         "format": "mp4" if is_video else "m4a",
-        "type": fallback_type
+        "type": stream_type
     }
 
 
@@ -1628,99 +1794,284 @@ def get_player_status():
     if MPV_PROCESS and MPV_PROCESS.poll() is not None:
         SERVER_PLAYER_STATE["state"] = "idle"
         MPV_PROCESS = None
+        if os.path.exists(MPV_SOCKET):
+            try:
+                os.remove(MPV_SOCKET)
+            except Exception:
+                pass
+
+    pos = 0.0
+    vol = SERVER_PLAYER_STATE.get("volume", 100.0)
+
+    # Si el socket IPC está disponible, consultar estado en vivo de MPV
+    if hasattr(socket, "AF_UNIX") and os.path.exists(MPV_SOCKET):
+        try:
+            pos_res = send_mpv_command(["get_property", "time-pos"])
+            if isinstance(pos_res, dict) and "data" in pos_res and pos_res["data"] is not None:
+                pos = round(float(pos_res["data"]), 2)
+            vol_res = send_mpv_command(["get_property", "volume"])
+            if isinstance(vol_res, dict) and "data" in vol_res and vol_res["data"] is not None:
+                vol = round(float(vol_res["data"]), 1)
+            pause_res = send_mpv_command(["get_property", "pause"])
+            if isinstance(pause_res, dict) and "data" in pause_res and pause_res["data"] is not None:
+                SERVER_PLAYER_STATE["state"] = "paused" if pause_res["data"] is True else "playing"
+        except Exception:
+            pass
 
     return {
         "state": SERVER_PLAYER_STATE["state"],
-        "current_track": SERVER_PLAYER_STATE["current_track"],
+        "current_track": SERVER_PLAYER_STATE.get("current_track", ""),
         "task_status": "IDLE",
         "download_progress": 0,
         "error": None,
-        "position": 0.0,
-        "volume": 1.0
+        "position": pos,
+        "volume": vol
     }
 
 
 @app.post("/api/play")
-def play_on_server(req: PlayRequest, bg_tasks: BackgroundTasks):
-    global SERVER_PLAYER_STATE, MPV_PROCESS
+def play_media(req: PlayRequest, bg_tasks: BackgroundTasks):
+    """
+    Inicia la reproducción con mpv optimizado según el hardware de destino:
+    - Pi 5: Permite decodificación completa 1080p/4K.
+    - Pi 3: Limita resolución a máximo 480p/720p, deshabilita postprocesados
+            pesados y reduce el tamaño de búfer para evitar cuelgues del SoC.
+    """
+    global CURRENT_MPV_PROCESS, MPV_PROCESS, IS_PAUSED, SERVER_PLAYER_STATE
+
+    # Detener reproducción anterior si existe
+    if hasattr(socket, "AF_UNIX") and os.path.exists(MPV_SOCKET):
+        try:
+            send_mpv_command(["quit"])
+        except Exception:
+            pass
+    stop_server_player()
+
+    is_video = ((req.format or "VIDEO").upper() == "VIDEO")
+    target_dev = (req.target_device or "rpi5").lower().strip()
+    quality_val = (req.quality or "best").lower().strip()
+    is_rpi3 = (target_dev == "rpi3" or quality_val in ("low", "480p", "360p") or (target_dev not in ("rpi5",) and is_rpi3_or_legacy()))
+
     raw_url = (req.url or "").strip()
-    v_id = req.id or extract_video_id(raw_url)
-    target = raw_url if raw_url.startswith("http") else f"https://www.youtube.com/watch?v={v_id}"
+    v_id = req.track_id or req.id or extract_video_id(raw_url)
+    target = raw_url if raw_url.startswith("http") else (f"https://www.youtube.com/watch?v={v_id}" if v_id else raw_url)
 
     SERVER_PLAYER_STATE["state"] = "playing"
-    SERVER_PLAYER_STATE["current_track"] = req.title or target
+    SERVER_PLAYER_STATE["current_track"] = req.title or target or "Pista"
     SERVER_PLAYER_STATE["url"] = target
-    SERVER_PLAYER_STATE["format"] = req.format or "video"
+    SERVER_PLAYER_STATE["format"] = "VIDEO" if is_video else "AUDIO"
 
-    # Iniciar reproducción por hardware en la Raspberry Pi si MPV está disponible
-    if shutil.which("mpv"):
-        stop_server_player()
-        is_audio = (req.format or "").strip().lower() in ["audio", "mp3"]
-        mpv_cmd = ["mpv", "--no-terminal", "--idle=no"]
-        if is_audio:
-            mpv_cmd.append("--no-video")
+    # Argumentos base para mpv
+    mpv_cmd = [
+        "mpv",
+        f"--input-ipc-server={MPV_SOCKET}",
+        "--no-terminal",
+        "--force-window=immediate"
+    ]
+
+    if is_video:
+        mpv_cmd.append("--fs")  # Fullscreen en pantalla HDMI
+
+        if is_rpi3:
+            # === PERFIL OPTIMIZADO PARA RASPBERRY PI 3 ===
+            # La Pi 3 tiene 1GB de RAM y CPU ARM Cortex-A53 que se satura con 1080p VP9/AV1
+            mpv_cmd.extend([
+                "--ytdl-format=bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best",
+                "--vo=gpu",
+                "--gpu-context=wayland,x11egl,drm",
+                "--hwdec=mmal,v4l2m2m-copy,auto-safe",
+                "--vd-lavc-fast",
+                "--vd-lavc-skiploopfilter=all",
+                "--cache=yes",
+                "--demuxer-max-bytes=32M",
+                "--demuxer-max-back-bytes=8M"
+            ])
+            logger.info(f"Reproduciendo en Raspberry Pi 3 (Calidad adaptada <=480p): {req.title}")
         else:
-            mpv_cmd.append("--fs")
-        mpv_cmd.append(target)
+            # === PERFIL PARA RASPBERRY PI 5 ===
+            # Pi 5 soporta 1080p / 4K fluidamente
+            mpv_cmd.extend([
+                "--ytdl-format=bestvideo[height<=1080]+bestaudio/best",
+                "--vo=gpu",
+                "--hwdec=auto-safe",
+                "--cache=yes",
+                "--demuxer-max-bytes=128M"
+            ])
+            logger.info(f"Reproduciendo en Raspberry Pi 5 (Calidad alta): {req.title}")
+    else:
+        # Modo solo audio
+        mpv_cmd.extend(["--no-video", "--ytdl-format=bestaudio/best"])
+
+    mpv_cmd.append(target)
+
+    if shutil.which("mpv"):
         try:
+            # Asegurar que el reproductor se muestre en la pantalla HDMI de la Pi (X11 / Wayland)
+            run_env = os.environ.copy()
+            if "DISPLAY" not in run_env:
+                run_env["DISPLAY"] = ":0"
+            if "XDG_RUNTIME_DIR" not in run_env and os.path.exists("/run/user/1000"):
+                run_env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+            if "WAYLAND_DISPLAY" not in run_env and os.path.exists("/run/user/1000/wayland-0"):
+                run_env["WAYLAND_DISPLAY"] = "wayland-0"
+
+            popen_kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "env": run_env
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
             with MPV_LOCK:
-                MPV_PROCESS = subprocess.Popen(
-                    mpv_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            logger.info(f"MPV iniciado para {target} (audio={is_audio})")
-        except Exception as pe:
-            logger.warning(f"No se pudo iniciar MPV en Raspberry Pi: {pe}")
+                proc = subprocess.Popen(mpv_cmd, **popen_kwargs)
+                CURRENT_MPV_PROCESS = proc
+                MPV_PROCESS = proc
+            IS_PAUSED = False
+        except Exception as e:
+            logger.error(f"Error al iniciar mpv: {e}")
+            return {"status": "error", "message": str(e)}
 
     # Caching automático de la pista en segundo plano para reproducciones instantáneas futuras
-    bg_tasks.add_task(cache_played_track, target, req.title, req.format)
+    if bg_tasks and target:
+        bg_tasks.add_task(cache_played_track, target, req.title, req.format)
 
     return {
         "status": "ok",
-        "message": f"Reproduciendo {target}",
-        "track": SERVER_PLAYER_STATE["current_track"]
+        "message": "Playback started",
+        "track": SERVER_PLAYER_STATE["current_track"],
+        "device": "rpi3" if is_rpi3 else "rpi5",
+        "device_profile": "rpi3" if is_rpi3 else "rpi5",
+        "video_mode": is_video
     }
 
+# Alias para compatibilidad
+play_on_server = play_media
 
-@app.post("/api/control")
+
 @app.post("/api/playback/action")
-def control_player(req: ControlRequest):
-    global SERVER_PLAYER_STATE, MPV_PROCESS
-    action = (req.action or "").lower().strip()
-    if action == "pause":
-        SERVER_PLAYER_STATE["state"] = "paused"
-        if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
-            try:
-                os.kill(MPV_PROCESS.pid, signal.SIGSTOP)
-            except Exception:
-                pass
-    elif action in ["stop"]:
-        SERVER_PLAYER_STATE["state"] = "idle"
-        stop_server_player()
-    elif action in ["resume", "play"]:
-        SERVER_PLAYER_STATE["state"] = "playing"
-        if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
-            try:
-                os.kill(MPV_PROCESS.pid, signal.SIGCONT)
-            except Exception:
-                pass
-    elif action == "toggle":
-        if SERVER_PLAYER_STATE["state"] == "playing":
+@app.post("/api/control")
+def playback_control(payload: ControlRequest):
+    """
+    Control unificado de reproducción.
+    Soporta:
+      - action="pause"  -> Pausa el reproductor
+      - action="play"   -> Reanuda la reproducción
+      - action="toggle" -> Alterna pausa / play
+      - action="stop"   -> Detiene y cierra el reproductor
+      - action="seek"   -> Salta a 'value' segundos
+      - action="volume" -> Ajusta volumen (0-100)
+    """
+    global CURRENT_MPV_PROCESS, MPV_PROCESS, IS_PAUSED, SERVER_PLAYER_STATE
+    action = payload.action.lower().strip()
+    value = payload.value
+
+    # Opción A: Control mediante MPV IPC Socket (Rápido y sin matar procesos)
+    if hasattr(socket, "AF_UNIX") and os.path.exists(MPV_SOCKET):
+        if action in ("pause", "pausa"):
+            res = send_mpv_command(["set_property", "pause", True])
+            IS_PAUSED = True
             SERVER_PLAYER_STATE["state"] = "paused"
-            if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
-                try:
-                    os.kill(MPV_PROCESS.pid, signal.SIGSTOP)
-                except Exception:
-                    pass
-        else:
+            return {"status": "ok", "state": "paused", "mpv_response": res}
+
+        elif action in ("play", "resume", "reanudar"):
+            res = send_mpv_command(["set_property", "pause", False])
+            IS_PAUSED = False
             SERVER_PLAYER_STATE["state"] = "playing"
-            if MPV_PROCESS and MPV_PROCESS.poll() is None and os.name != "nt":
-                try:
-                    os.kill(MPV_PROCESS.pid, signal.SIGCONT)
-                except Exception:
-                    pass
-    return {"status": "ok", "state": SERVER_PLAYER_STATE["state"]}
+            return {"status": "ok", "state": "playing", "mpv_response": res}
+
+        elif action in ("toggle", "playpause"):
+            res = send_mpv_command(["cycle", "pause"])
+            IS_PAUSED = not IS_PAUSED
+            state_str = "paused" if IS_PAUSED else "playing"
+            SERVER_PLAYER_STATE["state"] = state_str
+            return {"status": "ok", "state": state_str, "mpv_response": res}
+
+        elif action in ("stop", "detener"):
+            send_mpv_command(["quit"])
+            stop_server_player()
+            IS_PAUSED = False
+            SERVER_PLAYER_STATE["state"] = "idle"
+            return {"status": "ok", "state": "idle"}
+
+        elif action == "seek" and value:
+            try:
+                seconds = float(value)
+                res = send_mpv_command(["seek", seconds, "absolute"])
+                return {"status": "ok", "state": "seeking", "pos": value, "position": seconds, "mpv_response": res}
+            except (ValueError, TypeError):
+                return {"status": "error", "message": "Valor de seek inválido"}
+
+        elif action == "volume" and value:
+            try:
+                vol = float(value)
+                res = send_mpv_command(["set_property", "volume", vol])
+                SERVER_PLAYER_STATE["volume"] = vol
+                return {"status": "ok", "state": "volume_changed", "volume": vol, "mpv_response": res}
+            except (ValueError, TypeError):
+                return {"status": "error", "message": "Valor de volumen inválido"}
+
+        elif action in ("next", "prev"):
+            cmd_name = "playlist-next" if action == "next" else "playlist-prev"
+            res = send_mpv_command([cmd_name])
+            return {"status": "ok", "action": action, "state": SERVER_PLAYER_STATE["state"], "mpv_response": res}
+
+    # Opción B: Fallback mediante señales POSIX (SIGSTOP/SIGCONT/SIGTERM)
+    proc = CURRENT_MPV_PROCESS or MPV_PROCESS
+    if proc and proc.poll() is None:
+        import signal
+        pid = proc.pid
+        if action in ("pause", "pausa"):
+            if os.name != "nt":
+                os.kill(pid, signal.SIGSTOP)
+            IS_PAUSED = True
+            SERVER_PLAYER_STATE["state"] = "paused"
+            return {"status": "ok", "state": "paused"}
+        elif action in ("play", "resume", "reanudar"):
+            if os.name != "nt":
+                os.kill(pid, signal.SIGCONT)
+            IS_PAUSED = False
+            SERVER_PLAYER_STATE["state"] = "playing"
+            return {"status": "ok", "state": "playing"}
+        elif action in ("stop", "detener"):
+            stop_server_player()
+            IS_PAUSED = False
+            SERVER_PLAYER_STATE["state"] = "idle"
+            return {"status": "ok", "state": "idle"}
+
+    # Fallback sin proceso activo
+    if action in ("pause", "pausa"):
+        IS_PAUSED = True
+        SERVER_PLAYER_STATE["state"] = "paused"
+        return {"status": "ok", "state": "paused"}
+    elif action in ("play", "resume", "reanudar"):
+        IS_PAUSED = False
+        SERVER_PLAYER_STATE["state"] = "playing"
+        return {"status": "ok", "state": "playing"}
+    elif action in ("toggle", "playpause"):
+        IS_PAUSED = not IS_PAUSED
+        state_str = "paused" if IS_PAUSED else "playing"
+        SERVER_PLAYER_STATE["state"] = state_str
+        return {"status": "ok", "state": state_str}
+    elif action in ("stop", "detener"):
+        IS_PAUSED = False
+        SERVER_PLAYER_STATE["state"] = "idle"
+        return {"status": "ok", "state": "idle"}
+    elif action == "seek" and value:
+        try:
+            return {"status": "ok", "state": "seeking", "pos": value, "position": float(value)}
+        except ValueError:
+            return {"status": "error", "message": "Valor de seek inválido"}
+    elif action == "volume" and value:
+        try:
+            SERVER_PLAYER_STATE["volume"] = float(value)
+            return {"status": "ok", "state": "volume_changed", "volume": float(value)}
+        except ValueError:
+            return {"status": "error", "message": "Valor de volumen inválido"}
+
+    return {"status": "ok", "state": "idle", "message": "No active playback process"}
+
+# Alias para compatibilidad
+control_player = playback_control
 
 
 @app.get("/api/telemetry")
@@ -2196,6 +2547,144 @@ def clear_system_logs():
     except Exception as e:
         logger.error(f"Error al limpiar archivo de logs: {e}")
         raise HTTPException(status_code=500, detail=f"No se pudieron limpiar los registros: {e}")
+
+
+# =====================================================================
+# 9. RECEPTOR DE TELEMETRÍA Y LOGS DE LA APP ANDROID (app_telemetry.log)
+# =====================================================================
+
+class AppLogEntry(BaseModel):
+    timestamp: Optional[Any] = None
+    level: str = "INFO"  # INFO, WARN, ERROR, DIAGNOSTIC
+    tag: str = "App"
+    message: str = ""
+    details: Optional[str] = ""
+
+class BatchAppLogsRequest(BaseModel):
+    device_id: Optional[str] = "android_client"
+    app_version: Optional[str] = "1.0.0"
+    logs: List[AppLogEntry] = []
+
+@app.post("/api/logs/app")
+async def receive_app_logs(request: Request):
+    """
+    Recibe los logs de la app de Android para diagnóstico y mejora continua.
+    Guarda las entradas en app_telemetry.log.
+    """
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = await request.json()
+        else:
+            raw_text = (await request.body()).decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                data = {"message": raw_text}
+    except Exception as e:
+        data = {"message": f"Error parseando cuerpo de log: {e}"}
+
+    device_id = "android_client"
+    entries_count = 0
+
+    if isinstance(data, dict):
+        device_id = data.get("device_id") or data.get("device") or "android_client"
+        if "logs" in data and isinstance(data["logs"], list):
+            entries_count = len(data["logs"])
+            for entry in data["logs"]:
+                if isinstance(entry, dict):
+                    lvl = entry.get("level", "INFO")
+                    tag = entry.get("tag", "App")
+                    msg = entry.get("message", "")
+                    details = entry.get("details", "")
+                    app_logger.info(
+                        f"[{device_id}] [{lvl}] [{tag}] {msg} | Details: {details}"
+                    )
+                else:
+                    app_logger.info(f"[{device_id}] {entry}")
+        else:
+            entries_count = 1
+            lvl = data.get("level", "INFO")
+            tag = data.get("tag") or data.get("source") or "App"
+            msg = data.get("message") or data.get("event") or ""
+            details = data.get("details", "")
+            app_logger.info(
+                f"[{device_id}] [{lvl}] [{tag}] {msg} | Details: {details}"
+            )
+    elif isinstance(data, list):
+        entries_count = len(data)
+        for entry in data:
+            if isinstance(entry, dict):
+                lvl = entry.get("level", "INFO")
+                tag = entry.get("tag", "App")
+                msg = entry.get("message", "")
+                details = entry.get("details", "")
+                app_logger.info(
+                    f"[{device_id}] [{lvl}] [{tag}] {msg} | Details: {details}"
+                )
+            else:
+                app_logger.info(f"[{device_id}] {entry}")
+    else:
+        entries_count = 1
+        app_logger.info(f"[{device_id}] {data}")
+
+    for h in app_logger.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+    return {"status": "ok", "saved_entries": entries_count}
+
+
+@app.get("/api/logs/app")
+def get_app_logs(
+    lines: int = Query(150, ge=10, le=1000),
+    level: Optional[str] = Query(None, description="Filtro opcional: ERROR, WARNING, INFO")
+):
+    """Devuelve los últimos registros de telemetría emitidos por la aplicación Android."""
+    if not APP_LOG_FILE.exists():
+        return {
+            "logs": [],
+            "total_lines": 0,
+            "file_size": "0 B",
+            "file_path": str(APP_LOG_FILE)
+        }
+
+    try:
+        with open(APP_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except Exception as e:
+        logger.error(f"Error al leer archivo de telemetría de app {APP_LOG_FILE}: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudo leer el archivo de registros de la app: {e}")
+
+    total_lines = len(all_lines)
+    filtered = all_lines
+    if level and level.upper() != "ALL":
+        lvl_tag = f"[{level.upper()}]"
+        filtered = [l for l in all_lines if lvl_tag in l]
+
+    tail_lines = [l.rstrip("\r\n") for l in filtered[-lines:]]
+    file_size = format_filesize(APP_LOG_FILE.stat().st_size)
+
+    return {
+        "logs": tail_lines,
+        "total_lines": total_lines,
+        "file_size": file_size,
+        "file_path": str(APP_LOG_FILE)
+    }
+
+
+@app.delete("/api/logs/app")
+def clear_app_logs():
+    """Limpia el archivo de telemetría app_telemetry.log de forma segura."""
+    try:
+        with open(APP_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [INFO] [PiMusicApp] Registros de telemetría reiniciados.\n")
+        return {"status": "success", "message": "Registros de telemetría de la app limpiados correctamente."}
+    except Exception as e:
+        logger.error(f"Error al limpiar archivo de telemetría de app: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudieron limpiar los registros de la app: {e}")
 
 
 if STATIC_DIST.exists():
