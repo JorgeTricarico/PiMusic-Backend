@@ -20,6 +20,12 @@ def test_extract_video_id():
     assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
     # URL con parámetros adicionales
     assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s") == "dQw4w9WgXcQ"
+    # ID con parámetro si pegado (tracking de YouTube share)
+    assert extract_video_id("lri-3nCilqg?si=6dYJMfmSTTX6I5Du") == "lri-3nCilqg"
+    # ID con &t= pegado
+    assert extract_video_id("lri-3nCilqg&t=120") == "lri-3nCilqg"
+    # ID con #fragment pegado
+    assert extract_video_id("lri-3nCilqg#t=10") == "lri-3nCilqg"
 
 def test_terminal_execution(client):
     """Verifica que el panel de terminal de desarrollo ejecute comandos del sistema."""
@@ -479,6 +485,32 @@ def test_api_resolve_avoids_googlevideo_403_and_routes_to_server_proxy(client, m
     assert resp_local.status_code == 200
     assert "/api/library/stream/cancion_local.mp3" in resp_local.json()["stream_url"]
     assert resp_local.json().get("is_local") is True
+
+    # 4. Petición con ID sucio que contiene parámetro ?si= (típico de links compartidos)
+    resp_dirty = client.post("/api/resolve", json={
+        "id": "lri-3nCilqg?si=6dYJMfmSTTX6I5Du",
+        "type": "video",
+        "quality": "480p"
+    })
+    assert resp_dirty.status_code == 200
+    dirty_data = resp_dirty.json()
+    assert dirty_data["status"] == "ok"
+    assert "/api/stream_media/lri-3nCilqg?type=video&quality=480p" in dirty_data["stream_url"]
+    assert "?si=" not in dirty_data["stream_url"]
+    assert dirty_data["stream_url"].count("?") == 1
+    assert dirty_data["type"] == "video"
+
+
+def test_copito_endpoints(client):
+    """Verifica compatibilidad con Copito y OTA de llavero ESP32."""
+    resp = client.get("/copito/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "pi5" in data
+
+    resp_ota = client.get("/api/ota_version")
+    assert resp_ota.status_code in (200, 404)
 
 
 

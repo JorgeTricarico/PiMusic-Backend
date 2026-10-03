@@ -12,6 +12,7 @@ import time
 import json
 import re
 import socket
+import hashlib
 import logging
 import logging.handlers
 import asyncio
@@ -217,18 +218,32 @@ def get_media_mime_type(ext: str) -> str:
 # =====================================================================
 
 def extract_video_id(url_or_id: str) -> str:
-    url_or_id = url_or_id.strip()
-    if len(url_or_id) == 11 and re.match(r'^[a-zA-Z0-9_-]{11}$', url_or_id):
-        return url_or_id
+    if not url_or_id:
+        return ""
+    clean = str(url_or_id).strip()
+
+    # Si es exactamente un ID válido de 11 caracteres
+    if len(clean) == 11 and re.match(r'^[a-zA-Z0-9_-]{11}$', clean):
+        return clean
+
+    # Si tiene query string o fragmento pegado (ej. "lri-3nCilqg?si=...", "ID&t=10", "ID#frag")
+    if not clean.startswith("http") and any(c in clean for c in ('?', '&', '#')):
+        candidate = re.split(r'[?&#]', clean)[0].strip()
+        if len(candidate) == 11 and re.match(r'^[a-zA-Z0-9_-]{11}$', candidate):
+            return candidate
+
     patterns = [
-        r'(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([a-zA-Z0-9_-]{11})',
-        r'^[a-zA-Z0-9_-]{11}$'
+        r'(?:v=|\/|youtu\.be\/|embed\/|shorts\/|live\/)([a-zA-Z0-9_-]{11})',
+        r'([a-zA-Z0-9_-]{11})'
     ]
     for pattern in patterns:
-        m = re.search(pattern, url_or_id)
+        m = re.search(pattern, clean)
         if m:
-            return m.group(1)
-    return url_or_id
+            candidate = m.group(1)
+            if candidate.lower() not in ("watch", "embed", "video", "audio", "shorts"):
+                return candidate
+
+    return re.split(r'[?&#]', clean)[0].strip()
 
 
 class MediaMetadataCache:
@@ -953,6 +968,22 @@ async def stream_media(
     - Video Adaptativo (DASH/HLS) -> Live remuxing a fMP4 con FFmpeg (-c copy) sin recodificar.
     - Audio -> Proxy HTTP Range 206 o remux AAC directo.
     """
+    clean_v_id = extract_video_id(video_id)
+    if not clean_v_id:
+        clean_v_id = video_id.strip()
+
+    # Recuperación resiliente ante clientes con múltiples '?' concatenados
+    raw_query = request.url.query or ""
+    if "type=video" in raw_query:
+        type = "video"
+    elif "type=audio" in raw_query:
+        type = "audio"
+
+    if "quality=" in raw_query and not request.query_params.get("quality"):
+        m_q = re.search(r'quality=([0-9]+p|[a-zA-Z0-9_]+)', raw_query)
+        if m_q:
+            quality = m_q.group(1)
+
     if request.method == "HEAD":
         media_type = "audio/mp4" if type == "audio" or quality == "audio" else "video/mp4"
         return Response(
@@ -966,7 +997,7 @@ async def stream_media(
         )
 
     try:
-        data = await asyncio.to_thread(extract_and_cache_info, video_id)
+        data = await asyncio.to_thread(extract_and_cache_info, clean_v_id)
     except Exception as e:
         logger.error(f"Error al extraer info de video para stream_media: {e}")
         raise HTTPException(status_code=404, detail=f"No se pudo resolver el stream: {e}")
@@ -1704,7 +1735,7 @@ def download_library_file(filename: str):
 @app.post("/api/resolve")
 def resolve_stream_url(req: ResolveRequest, request: Request):
     raw_url = (req.url or "").strip()
-    v_id = req.id or extract_video_id(raw_url)
+    v_id = extract_video_id(req.id) if req.id else extract_video_id(raw_url)
     target = raw_url if raw_url.startswith("http") else f"https://www.youtube.com/watch?v={v_id}"
     if not v_id:
         v_id = extract_video_id(target)
@@ -2685,6 +2716,231 @@ def clear_app_logs():
     except Exception as e:
         logger.error(f"Error al limpiar archivo de telemetría de app: {e}")
         raise HTTPException(status_code=500, detail=f"No se pudieron limpiar los registros de la app: {e}")
+
+
+# =====================================================================
+# 19. INTEGRACIÓN Y COMPATIBILIDAD COPITO (ESP32 & SERVICIOS IA EN PI 5)
+# =====================================================================
+import urllib.request as _curl_lib
+
+FW_PATH = os.path.expanduser("~/bot/copito_fw.bin") if os.name != "nt" else os.path.join(tempfile.gettempdir(), "copito_fw.bin")
+COPITO_PI5 = os.environ.get("COPITO_PI5", "100.66.50.66")
+COPITO_KEYFILE = os.path.expanduser("~/.config/copito/funnel_key")
+_COPITO_HITS: Dict[str, List[float]] = {}
+
+
+def _copito_key() -> str:
+    try:
+        with open(COPITO_KEYFILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _copito_guard(request: Request):
+    key = _copito_key()
+    if key and request.headers.get("x-copito-key", "") != key:
+        raise HTTPException(status_code=403, detail="falta clave")
+    ip = request.client.host if request.client else "?"
+    now = time.time()
+    lst = [t for t in _COPITO_HITS.get(ip, []) if now - t < 60]
+    if len(lst) >= 120:
+        raise HTTPException(status_code=429, detail="rate limit")
+    lst.append(now)
+    _COPITO_HITS[ip] = lst
+
+
+async def _copito_proxy(request: Request, target: str, guard: bool = True):
+    if guard:
+        _copito_guard(request)
+    body = await request.body()
+    if len(body) > 1024 * 1024:
+        raise HTTPException(status_code=413, detail="body muy grande")
+    ctype = request.headers.get("content-type", "application/json")
+
+    def _do():
+        req = _curl_lib.Request(target, data=body or None,
+                                method=request.method,
+                                headers={"Content-Type": ctype})
+        _to = 240 if (target.rstrip("/").endswith(("/story", "/book"))
+                      or "?topic=" in target or "?texto=" in target) else 90
+        with _curl_lib.urlopen(req, timeout=_to) as resp:
+            return (resp.status,
+                    resp.getheader("Content-Type") or "application/octet-stream",
+                    resp.read(1024 * 1024 + 1))
+
+    try:
+        code, ctype_out, data = await asyncio.to_thread(_do)
+    except Exception as e:
+        c = getattr(e, "code", None)
+        if isinstance(c, int):
+            raise HTTPException(status_code=c, detail="pi5 error")
+        raise HTTPException(status_code=502, detail="pi5 sin respuesta")
+    return Response(content=data, status_code=code, media_type=ctype_out)
+
+
+@app.get("/api/copito_stream")
+def copito_stream(q: Optional[str] = Query(None), url: Optional[str] = Query(None), rate: int = Query(22050)):
+    if rate not in (8000, 11025, 16000, 22050):
+        rate = 22050
+    stream_url, title = None, None
+    if url and url.startswith("http"):
+        stream_url, title = url, (q or "Radio en vivo")
+    else:
+        if not q:
+            raise HTTPException(status_code=400, detail="falta q o url")
+        try:
+            ydl_opts = get_ydl_base_opts()
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch:{q}", download=False)
+                entries = info.get("entries") or []
+                if not entries:
+                    raise HTTPException(status_code=404, detail="sin resultados")
+                for entry in entries[:5]:
+                    vid = entry.get("id")
+                    if not vid:
+                        continue
+                    try:
+                        vinfo = extract_and_cache_info(vid)
+                        stream_url = vinfo.get("audio_options", {}).get("m4a", {}).get("url") or vinfo.get("url")
+                        title = vinfo.get("title", entry.get("title", q))
+                        if stream_url:
+                            break
+                    except Exception:
+                        continue
+                if not stream_url:
+                    raise HTTPException(status_code=502, detail="no se pudo resolver stream")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:200])
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-i", stream_url,
+           "-vn", "-f", "s16le", "-ar", str(rate), "-ac", "1", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def gen():
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    headers = {"X-Track-Title": ((title or q or "audio")[:120])}
+    return StreamingResponse(gen(), media_type=f"audio/L16;rate={rate};channels=1", headers=headers)
+
+
+@app.get("/api/ota_version")
+def ota_version():
+    if not os.path.exists(FW_PATH):
+        raise HTTPException(status_code=404, detail="sin firmware staged")
+    st = os.stat(FW_PATH)
+    h = hashlib.md5()
+    with open(FW_PATH, "rb") as f:
+        for ch in iter(lambda: f.read(65536), b""):
+            h.update(ch)
+    return {"version": h.hexdigest(), "size": st.st_size}
+
+
+@app.get("/api/ota_bin")
+def ota_bin():
+    if not os.path.exists(FW_PATH):
+        raise HTTPException(status_code=404, detail="sin firmware staged")
+    return FileResponse(FW_PATH, media_type="application/octet-stream",
+                        filename="copito_fw.bin")
+
+
+@app.get("/copito/health")
+async def copito_health(request: Request):
+    return {"ok": True, "key": bool(_copito_key()), "pi5": COPITO_PI5,
+            "guard": "X-Copito-Key"}
+
+
+@app.post("/copito/tts")
+async def copito_tts(request: Request):
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8881/tts")
+
+
+@app.get("/copito/story")
+async def copito_story(request: Request):
+    qs = str(request.url.query)
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/story?{qs}", guard=False)
+
+
+@app.get("/copito/story/img/{img_id}")
+async def copito_story_img(img_id: str, request: Request):
+    if len(img_id) > 32 or not img_id.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/story/img/{img_id}", guard=False)
+
+
+@app.get("/copito/story/jpg/{img_id}")
+async def copito_story_jpg(img_id: str, request: Request):
+    if len(img_id) > 32 or not img_id.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/story/jpg/{img_id}", guard=False)
+
+
+@app.get("/copito/story/audio/{audio_id}")
+async def copito_story_audio(audio_id: str, request: Request):
+    if len(audio_id) > 32 or not audio_id.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/story/audio/{audio_id}", guard=False)
+
+
+@app.get("/copito/demo")
+async def copito_demo(request: Request):
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/demo", guard=False)
+
+
+@app.get("/copito/book")
+async def copito_book(request: Request):
+    qs = str(request.url.query)
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book?{qs}", guard=False)
+
+
+@app.post("/copito/book")
+async def copito_book_post(request: Request):
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book", guard=False)
+
+
+def _copito_asset_id(v: str) -> bool:
+    return len(v) <= 64 and v.replace("_", "").replace("-", "").isalnum()
+
+
+@app.get("/copito/book/img/{img_id}")
+async def copito_book_img(img_id: str, request: Request):
+    if not _copito_asset_id(img_id):
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book/img/{img_id}", guard=False)
+
+
+@app.get("/copito/book/jpg/{img_id}")
+async def copito_book_jpg(img_id: str, request: Request):
+    if not _copito_asset_id(img_id):
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book/jpg/{img_id}", guard=False)
+
+
+@app.get("/copito/book/audio/{audio_id}")
+async def copito_book_audio(audio_id: str, request: Request):
+    if not _copito_asset_id(audio_id):
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book/audio/{audio_id}", guard=False)
+
+
+@app.get("/copito/book/layout/{slug}")
+async def copito_book_layout(slug: str, request: Request):
+    if not _copito_asset_id(slug):
+        raise HTTPException(status_code=400, detail="id invalido")
+    return await _copito_proxy(request, f"http://{COPITO_PI5}:8890/book/layout/{slug}")
 
 
 if STATIC_DIST.exists():
